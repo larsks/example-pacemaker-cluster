@@ -1,0 +1,95 @@
+- hosts: localhost
+  tags:
+    - req
+  tasks:
+    - docker:
+        name: "pcmk-{{item}}"
+        hostname: "pcmk-{{item}}"
+        state: started
+        image: centos:7
+        detach: true
+        command: /sbin/init
+        privileged: true
+        env:
+          container: docker
+      register: cluster
+      with_sequence: start=0 end=2
+
+    - add_host:
+        name: "pcmk-{{item}}"
+        group: docker
+        ansible_connection: docker
+      with_sequence: start=0 end=2
+
+- hosts: docker
+  gather_facts: false
+  tasks:
+    - raw: yum -y install python python-dnf libselinux-python iproute
+
+- hosts: docker
+  tasks:
+    - lineinfile:
+        create: true
+        dest: /etc/hosts.docker
+        regexp: "{{item}}"
+        line: "{{hostvars[item]['ansible_default_ipv4']['address']}} {{item}}"
+      with_items: groups.docker
+      register: hosts
+
+    - shell: cat /etc/hosts.docker >> /etc/hosts
+      when: hosts|changed
+
+    - yum:
+        name: "{{item}}"
+        state: installed
+      with_items:
+        - corosync
+        - pacemaker
+        - pcs
+
+    - shell: |
+        echo hacluster:hacluster | chpasswd
+
+    - name: generate corosync.conf
+      template:
+        src: corosync.conf
+        dest: /etc/corosync/corosync.conf
+      notify: restart corosync
+    - name: configure corosync
+      command: >
+        pcs cluster setup --name docker --local --force {{groups['docker']|join(' ')}}
+    - name: start cluster services
+      service:
+        name: "{{item}}"
+        state: running
+        enabled: true
+      with_items:
+        - corosync
+        - pacemaker
+    - name: disable stonith
+      command: pcs property set stonith-enabled=false
+  handlers:
+    - name: Restart corosync
+      service:
+        name: corosync
+        state: restarted
+
+- hosts: docker
+  tags:
+    - sshd
+  tasks:
+    - name: install sshd 
+      yum:
+        name: openssh-server
+        state: installed
+
+- hosts: docker[0]
+  tags:
+    - sshd
+  tasks:
+    - name: check if sshd resource exists
+      command: pcs resource
+      register: sshd
+    - name: create sshd resource
+      command: pcs resource create sshd systemd:sshd --clone
+      when: "'sshd' not in sshd.stdout"
